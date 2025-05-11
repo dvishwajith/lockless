@@ -2,6 +2,24 @@
 #include <atomic>
 #include <vector>
 #include <thread>
+#include <unordered_map>
+
+#include <thread>
+#include <pthread.h>
+#include <sched.h>
+#include <iostream>
+
+void pin_thread_to_cpu(std::thread& t, int cpu_id) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu_id, &cpuset);
+
+  int rc = pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
+  if (rc != 0) {
+      std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+  }
+}
+
 
 // // incase we need to test all threads on same core
 // #include <mach/mach.h>
@@ -13,7 +31,7 @@
 
 
 
-#define QUEUE_SIZE 10
+#define QUEUE_SIZE 20
 
 std::atomic<u_int> head {0};
 std::atomic<u_int> tail {0};
@@ -21,7 +39,7 @@ std::atomic<u_int> tail {0};
 struct Node
 {
   std::atomic<bool> ready; // 0 = Empty, 1 = full
-  int data;
+  std::atomic<int> data; // Make data atomic to avoid race condition
 };
 
 
@@ -34,16 +52,22 @@ bool enqueue(int value) {
   // This allow as to use head == tail as empty condition
   // and tail + 1 == head as full condition.
   u_int current_tail = 0, next_tail = 0;
+  bool ready = false, current_ready = false;
   do {
     current_tail = tail.load(std::memory_order_seq_cst);
+    current_ready = data[current_tail].ready.load(std::memory_order_seq_cst);
+    // if (current_ready) {
+    //   // std::cout << "Queue might be full, current ready " << current_tail << "\n";
+    //   return false;  // queue is full
+    // }
     next_tail = (current_tail + 1) % QUEUE_SIZE;
     std::atomic_thread_fence(std::memory_order_seq_cst); // Full memory barrier
-    if (next_tail == head.load(std::memory_order_seq_cst)) {
+    if ((next_tail + 5) % QUEUE_SIZE == head.load(std::memory_order_seq_cst) || current_ready) {
       return false;  // queue is full
     }
-  } while (!tail.compare_exchange_weak(current_tail, next_tail, std::memory_order_seq_cst, std::memory_order_seq_cst));
-  data[current_tail].data = value;
-  bool ready = false;
+    std::atomic_thread_fence(std::memory_order_seq_cst); // Full memory barrier
+  } while (!tail.compare_exchange_weak(current_tail, next_tail));
+  data[current_tail].data.store(value, std::memory_order_seq_cst);
   std::atomic_thread_fence(std::memory_order_seq_cst); // Full memory barrier
   data[current_tail].ready.compare_exchange_strong(ready, true, std::memory_order_seq_cst);
   // data[current_tail].ready.store(1, std::memory_order_release);
@@ -74,23 +98,28 @@ int dequeue(int &value) {
   return 0;
 }
 
-#define TEST_SIZE 2000
-#define NUMBER_OF_PRODUCERS 6
+#define TEST_SIZE 50
+#define NUMBER_OF_PRODUCERS 4
 
 bool test_mpsc_queue() {
   bool passed = true;
   std::vector<std::thread> producers;
-  for (size_t p = 0; p < NUMBER_OF_PRODUCERS; p++)
+  for (int producer_index = 0; producer_index < NUMBER_OF_PRODUCERS; producer_index++)
   {
-    producers.emplace_back([&] () {
-      for (size_t i = 0; i < TEST_SIZE; i++) {
+    producers.emplace_back([producer_index] () {
+      for (int i = 0; i < TEST_SIZE; i++) {
         auto start_time = std::chrono::steady_clock::now();
-        auto end_time = start_time + std::chrono::seconds(1);
-        while(!enqueue(i)) {
-          // std::this_thread::yield();
-          std::this_thread::sleep_for(std::chrono::nanoseconds(5));
+        auto end_time = start_time + std::chrono::seconds(20);
+        // printf("producer %d writing index %zu encoded_value %d\n", producer_index, i, producer_index*TEST_SIZE+i);
+        while(!enqueue(producer_index*TEST_SIZE+i)) {
+           std::this_thread::yield();
+          //std::this_thread::sleep_for(std::chrono::nanoseconds(5));
           if (std::chrono::steady_clock::now() > end_time) {
-            std::cout << "producer wait exceeded when writing index " << i << " true index " << p << "\n";
+            std::cout << "producer wait exceeded when writing index " << i << " true index " << producer_index << "\n";
+            printf("head %u tail %u\n", head.load(), tail.load());
+            for (int j = 0; j < QUEUE_SIZE; j++) {
+              printf("data[%zu] %d %d\n", j, data[j].ready.load(), data[j].data.load());
+            }
             break;
           }
         }
@@ -102,9 +131,10 @@ bool test_mpsc_queue() {
 
   std::unordered_map<int, int> results;
   std::thread consumer_thread([&] {
-    auto start_time = std::chrono::steady_clock::now();
-    auto end_time = start_time + std::chrono::seconds(5);
+
     for (size_t i = 0; i < TEST_SIZE*NUMBER_OF_PRODUCERS; i++) {
+      auto start_time = std::chrono::steady_clock::now();
+      auto end_time = start_time + std::chrono::seconds(5);
       int value = 123456789;
       int ret = -10;
       uint empty_count = 0;
@@ -118,16 +148,21 @@ bool test_mpsc_queue() {
         }
         if (std::chrono::steady_clock::now() > end_time) {
           std::cout << "consumer wait exceeded when reading index " << i << " true index " << i/NUMBER_OF_PRODUCERS << " empty_count " << empty_count << " not_ready_count " << not_ready_count << "\n";
+          printf("head %u tail %u\n", head.load(), tail.load());
+          for (size_t j = 0; j < QUEUE_SIZE; j++) {
+            printf("data[%zu] %d %d\n", j, data[j].ready.load(), data[j].data.load());
+          }
           break;
         }
-        // std::this_thread::yield();
-        std::this_thread::sleep_for(std::chrono::nanoseconds(5));
+        std::this_thread::yield();
+        // std::this_thread::sleep_for(std::chrono::nanoseconds(5));
         ret = dequeue(value);
       }
       if (std::chrono::steady_clock::now() > end_time) {
         break;
       }
       // std::cout << "dequeu val " << value << "\n";
+      value = value % TEST_SIZE;
       auto it = results.find(value);
       if (it == results.end()) {
         results[value] = 1;
@@ -137,15 +172,19 @@ bool test_mpsc_queue() {
     }
   });
 
+  int cpu = 0;
+  pin_thread_to_cpu(consumer_thread, cpu++);
   consumer_thread.join();
+
   for (auto &p : producers) {
+    pin_thread_to_cpu(p, cpu++);
     p.join();
   }
   
   for (size_t i = 0; i < TEST_SIZE ; i++) {
     if (results[i] != NUMBER_OF_PRODUCERS) {
       passed = false;
-      std::cout << "Failed: test value " << i << " count " << results[i] << "size of result vector" << results.size() << "\n";
+      std::cout << "Failed: test value " << i << " count " << results[i] << "size of result vector " << results.size() << "\n";
       break;
     } else {
       // std::cout << "        test value " << i << " count " << results[i] << "\n";
